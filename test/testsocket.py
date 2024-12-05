@@ -9,7 +9,6 @@
 import time
 import random
 
-from socket import socket
 from threading import Lock
 
 from scapy.config import conf
@@ -25,9 +24,13 @@ from typing import (
     Tuple,
     Any,
     List,
-    cast,
 )
 from scapy.supersocket import SuperSocket
+
+from scapy.plist import (
+    PacketList,
+    SndRcvList,
+)
 
 
 open_test_sockets = list()  # type: List[TestSocket]
@@ -58,6 +61,25 @@ class TestSocket(SuperSocket):
         # type: (Optional[Type[BaseException]], Optional[BaseException], Optional[Any]) -> None  # noqa: E501
         """Close the socket"""
         self.close()
+
+    def sr(self, *args, **kargs):
+        # type: (Any, Any) -> Tuple[SndRcvList, PacketList]
+        """Send and Receive multiple packets
+        """
+        from scapy import sendrecv
+        return sendrecv.sndrcv(self, *args, threaded=False, **kargs)
+
+    def sr1(self, *args, **kargs):
+        # type: (Any, Any) -> Optional[Packet]
+        """Send one packet and receive one answer
+        """
+        from scapy import sendrecv
+        ans = sendrecv.sndrcv(self, *args, threaded=False, **kargs)[0]  # type: SndRcvList
+        if len(ans) > 0:
+            pkt = ans[0][1]  # type: Packet
+            return pkt
+        else:
+            return None
 
     def close(self):
         # type: () -> None
@@ -136,8 +158,8 @@ class UnstableSocket(TestSocket):
             self.no_error_for_x_tx_pkts -= 1
         return super(UnstableSocket, self).send(x)
 
-    def recv(self, x=MTU):
-        # type: (int) -> Optional[Packet]
+    def recv(self, x=MTU, **kwargs):
+        # type: (int, **Any) -> Optional[Packet]
         if self.no_error_for_x_tx_pkts == 0:
             if random.randint(0, 1000) == 42:
                 self.no_error_for_x_tx_pkts = 10
@@ -153,7 +175,7 @@ class UnstableSocket(TestSocket):
                 return None
         if self.no_error_for_x_tx_pkts > 0:
             self.no_error_for_x_tx_pkts -= 1
-        return super(UnstableSocket, self).recv(x)
+        return super(UnstableSocket, self).recv(x, **kwargs)
 
 
 def cleanup_testsockets():

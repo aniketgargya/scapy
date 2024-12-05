@@ -139,7 +139,7 @@ assert r == b"FOO\x01\x02\x03\x04"
 = SourceIPField
 ~ core field
 defaddr = conf.route.route('0.0.0.0')[1]
-class Test(Packet): fields_desc = [SourceIPField("sourceip", None)]
+class Test(Packet): fields_desc = [SourceIPField("sourceip")]
 
 assert Test().sourceip == defaddr
 assert Test(raw(Test())).sourceip == defaddr
@@ -204,6 +204,14 @@ class TestFuzzNBytesField(Packet):
 f = fuzz(TestFuzzNBytesField())
 assert f.test1.max == 2 ** (128 * 8) - 1
 
+p2 = TestNBytesField(raw(p))
+assert p2.sprintf('%test1% %test2% %test3% %test4%') == '18838586676582 0xc000ff3333 0xffeeddccbbaa9988776655 309404098707666285700277845'
+assert p2.test1 == 18838586676582
+assert p2.test2 == 0xc000ff3333
+assert p2.test3 == 0xffeeddccbbaa9988776655
+assert p2.test4 == 309404098707666285700277845
+assert raw(p2) == raw(TestNBytesField(test1=p2.test1, test2=p2.test2, test3=p2.test3, test4=p2.test4))
+
 = StrField
 ~ field strfield
 ~ field strlenfield
@@ -218,7 +226,7 @@ class TestStrField(Packet):
 p = TestStrField(s1="cafe", s2="deadbeef")
 assert raw(p) == b'\x04\x00cafedeadbeef'
 print(p.sprintf("%s1% %s2%"))
-assert p.sprintf("%s1% %s2%") == "'cafe' 'deadbeef'"
+assert p.sprintf("%s1% %s2%") == "b'cafe' b'deadbeef'"
 
 
 = StrFieldUtf16
@@ -336,7 +344,48 @@ p = TestBFLenF(b"\xff\x6fabcdeFGH")
 p
 assert p.len == 6 and p.str == b"abcde" and Raw in p and p[Raw].load == b"FGH"
 
+= Test BitLenField
+~ field
 
+SIZES = {0: 6, 1: 6, 2: 14, 3: 22}
+
+class TestBitLenField(Packet):
+    fields_desc = [
+        BitField("mode", 0, 2),
+        BitLenField("value", 0, length_from=lambda pkt: SIZES[pkt.mode])
+    ]
+
+p = TestBitLenField(mode=1, value=50)
+assert bytes(p) == b"r"
+
+p = TestBitLenField(mode=2, value=5000)
+assert bytes(p) == b'\x93\x88'
+
+p = TestBitLenField(b'\xc0\x01\xf4')
+assert p.mode == 3
+assert p.value == 500
+
+= Test UTCTimeField
+~ field
+
+class TestUTCTimeField(Packet):
+    fields_desc = [
+        # A Windows time field. See GH#4308
+        UTCTimeField(
+            "Time",
+            None,
+            fmt="<Q",
+            epoch=[1601, 1, 1, 0, 0, 0],
+            custom_scaling=1e7,
+        )
+    ]
+
+
+p = TestUTCTimeField(Time=0)
+assert p.sprintf("%Time%") == 'Mon, 01 Jan 1601 00:00:00  (-11644473600)'
+
+p = TestUTCTimeField(Time=133587912345678900)
+assert p.sprintf("%Time%") == 'Sun, 28 Apr 2024 15:20:34  (1714317634)'
 
 ############
 ############
@@ -813,6 +862,53 @@ while p.pl:
     i += 1
 
 assert i == 100
+
+= Test cache handling of payload modification in a PacketListField
+~ field
+
+# GH4414
+class SubPacket(Packet):
+    fields_desc = [
+        ByteField("b", 0),
+    ]
+
+class MyPacket(Packet):
+    fields_desc = [
+        PacketListField("a", [], SubPacket),
+    ]
+
+
+p = MyPacket(b"\x00extrapayload")
+p.a[0] = SubPacket(b=0) / b"test"
+
+assert bytes(p) == b"\x00test"
+
+= Test cache handling of payload modification in a PacketField
+~ field
+
+# also GH4414
+class PayloadPacket(Packet):
+    fields_desc = [
+        StrField("b", ""),
+    ]
+
+class SubPacket(Packet):
+    fields_desc = []
+
+bind_layers(SubPacket, PayloadPacket)
+
+class MyPacket(Packet):
+    fields_desc = [
+        PacketField("a", None, SubPacket),
+    ]
+
+
+s = b'test'
+p = MyPacket(s)
+
+p[PayloadPacket].b = b'new'
+assert p.build() != s
+
 
 ############
 ############

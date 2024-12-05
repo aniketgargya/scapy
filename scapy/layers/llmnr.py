@@ -14,7 +14,13 @@ RFC also envisions LLMNR over TCP. Like vista, we don't support it -- arno
 
 import struct
 
-from scapy.fields import BitEnumField, BitField, ShortField
+from scapy.fields import (
+    BitEnumField,
+    BitField,
+    DestField,
+    DestIP6Field,
+    ShortField,
+)
 from scapy.packet import Packet, bind_layers, bind_bottom_up
 from scapy.compat import orb
 from scapy.layers.inet import UDP
@@ -22,6 +28,8 @@ from scapy.layers.dns import (
     DNSCompressedPacket,
     DNS_am,
     DNS,
+    DNSQR,
+    DNSRR,
 )
 
 
@@ -37,7 +45,8 @@ class LLMNRQuery(DNSCompressedPacket):
         BitField("qr", 0, 1),
         BitEnumField("opcode", 0, 4, {0: "QUERY"}),
         BitField("c", 0, 1),
-        BitField("tc", 0, 2),
+        BitField("tc", 0, 1),
+        BitField("t", 0, 1),
         BitField("z", 0, 4)
     ] + DNS.fields_desc[-9:]
     overload_fields = {UDP: {"sport": 5355, "dport": 5355}}
@@ -50,15 +59,22 @@ class LLMNRQuery(DNSCompressedPacket):
         return struct.pack("!H", self.id)
 
     def mysummary(self):
-        if self.an:
-            return "LLMNRResponse '%s' is at '%s'" % (
-                self.an[0].rrname.decode(errors="backslashreplace"),
-                self.an[0].rdata,
-            ), [UDP]
-        if self.qd:
-            return "LLMNRQuery who has '%s'" % (
+        s = self.__class__.__name__
+        if self.qr:
+            if self.an and isinstance(self.an[0], DNSRR):
+                s += " '%s' is at '%s'" % (
+                    self.an[0].rrname.decode(errors="backslashreplace"),
+                    self.an[0].rdata,
+                )
+            else:
+                s += " [malformed]"
+        elif self.qd and isinstance(self.qd[0], DNSQR):
+            s += " who has '%s'" % (
                 self.qd[0].qname.decode(errors="backslashreplace"),
-            ), [UDP]
+            )
+        else:
+            s += " [malformed]"
+        return s, [UDP]
 
 
 class LLMNRResponse(LLMNRQuery):
@@ -87,9 +103,24 @@ bind_bottom_up(UDP, _LLMNR, dport=5355)
 bind_bottom_up(UDP, _LLMNR, sport=5355)
 bind_layers(UDP, _LLMNR, sport=5355, dport=5355)
 
+DestField.bind_addr(LLMNRQuery, _LLMNR_IPv4_mcast_addr, dport=5355)
+DestField.bind_addr(LLMNRResponse, _LLMNR_IPv4_mcast_addr, dport=5355)
+DestIP6Field.bind_addr(LLMNRQuery, _LLMNR_IPv6_mcast_Addr, dport=5355)
+DestIP6Field.bind_addr(LLMNRResponse, _LLMNR_IPv6_mcast_Addr, dport=5355)
+
 
 class LLMNR_am(DNS_am):
-    function_name = "llmnr_spoof"
+    """
+    LLMNR answering machine.
+
+    This has the same arguments as DNS_am. See help(DNS_am)
+
+    Example::
+
+        >>> llmnrd(joker="192.168.0.2", iface="eth0")
+        >>> llmnrd(match={"TEST": "192.168.0.2"})
+    """
+    function_name = "llmnrd"
     filter = "udp port 5355"
     cls = LLMNRQuery
 

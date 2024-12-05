@@ -63,8 +63,16 @@ from scapy.sendrecv import sniff, sendp
 if conf.crypto_valid:
     from cryptography.hazmat.backends import default_backend
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+
+    try:
+        # cryptography > 43.0
+        from cryptography.hazmat.decrepit.ciphers import (
+            algorithms as decrepit_algorithms,
+        )
+    except ImportError:
+        decrepit_algorithms = algorithms
 else:
-    default_backend = Ciphers = algorithms = None
+    default_backend = Ciphers = algorithms = decrepit_algorithms = None
     log_loading.info("Can't import python-cryptography v1.7+. Disabled WEP decryption/encryption. (Dot11)")  # noqa: E501
 
 
@@ -970,7 +978,7 @@ _dot11_info_elts_ids = {
     61: "HT Operation",
     74: "Overlapping BSS Scan Parameters",
     107: "Interworking",
-    127: "Extendend Capabilities",
+    127: "Extended Capabilities",
     191: "VHT Capabilities",
     192: "VHT Operation",
     221: "Vendor Specific"
@@ -1282,7 +1290,14 @@ class Dot11EltCountry(Dot11Elt):
         # When this extension is last, padding appears to be omitted
         ConditionalField(
             ByteField("pad", 0),
-            lambda pkt: (len(pkt.descriptors) + 1) % 2
+            # The length should be 3 bytes per each triplet, and 3 bytes for the
+            # country_string field. The standard dictates that the element length
+            # must be even, so if the result is odd, add a padding byte.
+            # Some transmitters don't comply with the standard, so instead of assuming
+            # the length, we test whether there is a padding byte.
+            # Some edge cases are still not covered, for example, if the tag length
+            # (pkt.len) is an arbitrary number.
+            lambda pkt: ((len(pkt.descriptors) + 1) % 2) if pkt.len is None else (pkt.len % 3)  # noqa: E501
         )
     ]
 
@@ -1443,6 +1458,7 @@ class Dot11EltMicrosoftWPA(Dot11EltVendorSpecific):
 
 class Dot11EltCSA(Dot11Elt):
     name = "802.11 CSA Element"
+    match_subclass = True
     fields_desc = [
         ByteEnumField("ID", 37, _dot11_id_enum),
         ByteField("len", 3),
@@ -1456,6 +1472,7 @@ class Dot11EltCSA(Dot11Elt):
 
 class Dot11EltOBSS(Dot11Elt):
     name = "802.11 OBSS Scan Parameters Element"
+    match_subclass = True
     fields_desc = [
         ByteEnumField("ID", 74, _dot11_id_enum),
         ByteField("len", 14),
@@ -1485,6 +1502,7 @@ class Dot11VHTOperationInfo(Packet):
 
 class Dot11EltVHTOperation(Dot11Elt):
     name = "802.11 VHT Operation Element"
+    match_subclass = True
     fields_desc = [
         ByteEnumField("ID", 192, _dot11_id_enum),
         ByteField("len", 5),
@@ -1566,7 +1584,13 @@ class Dot11Auth(_Dot11EltUtils):
                    LEShortEnumField("status", 0, status_code)]
 
     def answers(self, other):
-        if self.seqnum == other.seqnum + 1:
+        if self.algo != other.algo:
+            return 0
+
+        if (
+            self.seqnum == other.seqnum + 1 or
+            (self.algo == 3 and self.seqnum == other.seqnum)
+        ):
             return 1
         return 0
 
@@ -1860,7 +1884,7 @@ class Dot11WEP(Dot11Encrypted):
             key = conf.wepkey
         if key and conf.crypto_valid:
             d = Cipher(
-                algorithms.ARC4(self.iv + key.encode("utf8")),
+                decrepit_algorithms.ARC4(self.iv + key.encode("utf8")),
                 None,
                 default_backend(),
             ).decryptor()
@@ -1885,7 +1909,7 @@ class Dot11WEP(Dot11Encrypted):
             else:
                 icv = p[4:8]
             e = Cipher(
-                algorithms.ARC4(self.iv + key.encode("utf8")),
+                decrepit_algorithms.ARC4(self.iv + key.encode("utf8")),
                 None,
                 default_backend(),
             ).encryptor()
@@ -2048,7 +2072,7 @@ iwconfig wlan0 mode managed
         ip = p.getlayer(IP)
         tcp = p.getlayer(TCP)
         pay = raw(tcp.payload)
-        del p.payload.payload.payload
+        p[IP].underlayer.remove_payload()
         p.FCfield = "from-DS"
         p.addr1, p.addr2 = p.addr2, p.addr1
         p /= IP(src=ip.dst, dst=ip.src)

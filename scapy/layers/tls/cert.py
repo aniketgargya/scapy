@@ -36,19 +36,42 @@ from scapy.error import warning
 from scapy.utils import binrepr
 from scapy.asn1.asn1 import ASN1_BIT_STRING
 from scapy.asn1.mib import hash_by_oid
-from scapy.layers.x509 import (X509_SubjectPublicKeyInfo,
-                               RSAPublicKey, RSAPrivateKey,
-                               ECDSAPublicKey, ECDSAPrivateKey,
-                               RSAPrivateKey_OpenSSL, ECDSAPrivateKey_OpenSSL,
-                               X509_Cert, X509_CRL)
+from scapy.layers.x509 import (
+    ECDSAPrivateKey_OpenSSL,
+    ECDSAPrivateKey,
+    ECDSAPublicKey,
+    EdDSAPublicKey,
+    EdDSAPrivateKey,
+    RSAPrivateKey_OpenSSL,
+    RSAPrivateKey,
+    RSAPublicKey,
+    X509_Cert,
+    X509_CRL,
+    X509_SubjectPublicKeyInfo,
+)
 from scapy.layers.tls.crypto.pkcs1 import pkcs_os2ip, _get_hash, \
     _EncryptAndVerifyRSA, _DecryptAndSignRSA
 from scapy.compat import raw, bytes_encode
+
 if conf.crypto_valid:
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.backends import default_backend
     from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa, ec
+    from cryptography.hazmat.primitives.asymmetric import rsa, ec, x25519
+
+    # cryptography raised the minimum RSA key length to 1024 in 43.0+
+    # https://github.com/pyca/cryptography/pull/10278
+    # but we need still 512 for EXPORT40 ciphers (yes EXPORT is terrible)
+    # https://datatracker.ietf.org/doc/html/rfc2246#autoid-66
+    # The following detects the change and hacks around it using the backend
+
+    try:
+        rsa.generate_private_key(public_exponent=65537, key_size=512)
+        _RSA_512_SUPPORTED = True
+    except ValueError:
+        # cryptography > 43.0
+        _RSA_512_SUPPORTED = False
+        from cryptography.hazmat.primitives.asymmetric.rsa import rust_openssl
 
 
 # Maximum allowed size in bytes for a certificate file, to avoid
@@ -206,7 +229,8 @@ class _PubKeyFactory(_PKIObjMaker):
         # Now for the usual calls, key_path may be the path to either:
         # _an X509_SubjectPublicKeyInfo, as processed by openssl;
         # _an RSAPublicKey;
-        # _an ECDSAPublicKey.
+        # _an ECDSAPublicKey;
+        # _an EdDSAPublicKey.
         obj = _PKIObjMaker.__call__(cls, key_path, _MAX_KEY_SIZE)
         try:
             spki = X509_SubjectPublicKeyInfo(obj.der)
@@ -216,10 +240,10 @@ class _PubKeyFactory(_PKIObjMaker):
                 obj.import_from_asn1pkt(pubkey)
             elif isinstance(pubkey, ECDSAPublicKey):
                 obj.__class__ = PubKeyECDSA
-                try:
-                    obj.import_from_der(obj.der)
-                except ImportError:
-                    pass
+                obj.import_from_der(obj.der)
+            elif isinstance(pubkey, EdDSAPublicKey):
+                obj.__class__ = PubKeyEdDSA
+                obj.import_from_der(obj.der)
             else:
                 raise
             marker = b"PUBLIC KEY"
@@ -231,6 +255,8 @@ class _PubKeyFactory(_PKIObjMaker):
                 marker = b"RSA PUBLIC KEY"
             except Exception:
                 # We cannot import an ECDSA public key without curve knowledge
+                if conf.debug_dissector:
+                    raise
                 raise Exception("Unable to import public key")
 
         if obj.frmt == "DER":
@@ -263,9 +289,18 @@ class PubKeyRSA(PubKey, _EncryptAndVerifyRSA):
         pubExp = pubExp or 65537
         if not modulus:
             real_modulusLen = modulusLen or 2048
-            private_key = rsa.generate_private_key(public_exponent=pubExp,
-                                                   key_size=real_modulusLen,
-                                                   backend=default_backend())
+            if real_modulusLen < 1024 and not _RSA_512_SUPPORTED:
+                # cryptography > 43.0 compatibility
+                private_key = rust_openssl.rsa.generate_private_key(
+                    public_exponent=pubExp,
+                    key_size=real_modulusLen,
+                )
+            else:
+                private_key = rsa.generate_private_key(
+                    public_exponent=pubExp,
+                    key_size=real_modulusLen,
+                    backend=default_backend(),
+                )
             self.pubkey = private_key.public_key()
         else:
             real_modulusLen = len(binrepr(modulus))
@@ -321,11 +356,12 @@ class PubKeyECDSA(PubKey):
     @crypto_validator
     def import_from_der(self, pubkey):
         # No lib support for explicit curves nor compressed points.
-        self.pubkey = serialization.load_der_public_key(pubkey,
-                                                        backend=default_backend())  # noqa: E501
+        self.pubkey = serialization.load_der_public_key(
+            pubkey,
+            backend=default_backend(),
+        )
 
     def encrypt(self, msg, h="sha256", **kwargs):
-        # cryptography lib does not support ECDSA encryption
         raise Exception("No ECDSA encryption support")
 
     @crypto_validator
@@ -333,6 +369,37 @@ class PubKeyECDSA(PubKey):
         # 'sig' should be a DER-encoded signature, as per RFC 3279
         try:
             self.pubkey.verify(sig, msg, ec.ECDSA(_get_hash(h)))
+            return True
+        except InvalidSignature:
+            return False
+
+
+class PubKeyEdDSA(PubKey):
+    """
+    Wrapper for EdDSA keys based on the cryptography library.
+    Use the 'key' attribute to access original object.
+    """
+    @crypto_validator
+    def fill_and_store(self, curve=None):
+        curve = curve or x25519.X25519PrivateKey
+        private_key = curve.generate()
+        self.pubkey = private_key.public_key()
+
+    @crypto_validator
+    def import_from_der(self, pubkey):
+        self.pubkey = serialization.load_der_public_key(
+            pubkey,
+            backend=default_backend(),
+        )
+
+    def encrypt(self, msg, **kwargs):
+        raise Exception("No EdDSA encryption support")
+
+    @crypto_validator
+    def verify(self, msg, sig, **kwargs):
+        # 'sig' should be a DER-encoded signature, as per RFC 3279
+        try:
+            self.pubkey.verify(sig, msg)
             return True
         except InvalidSignature:
             return False
@@ -390,7 +457,12 @@ class _PrivKeyFactory(_PKIObjMaker):
                         obj.__class__ = PrivKeyECDSA
                         marker = b"EC PRIVATE KEY"
                     except Exception:
-                        raise Exception("Unable to import private key")
+                        try:
+                            privkey = EdDSAPrivateKey(obj.der)
+                            obj.__class__ = PrivKeyEdDSA
+                            marker = b"PRIVATE KEY"
+                        except Exception:
+                            raise Exception("Unable to import private key")
         try:
             obj.import_from_asn1pkt(privkey)
         except ImportError:
@@ -470,9 +542,18 @@ class PrivKeyRSA(PrivKey, _EncryptAndVerifyRSA, _DecryptAndSignRSA):
             # in order to call RSAPrivateNumbers(...)
             # if one of these is missing, we generate a whole new key
             real_modulusLen = modulusLen or 2048
-            self.key = rsa.generate_private_key(public_exponent=pubExp,
-                                                key_size=real_modulusLen,
-                                                backend=default_backend())
+            if real_modulusLen < 1024 and not _RSA_512_SUPPORTED:
+                # cryptography > 43.0 compatibility
+                self.key = rust_openssl.rsa.generate_private_key(
+                    public_exponent=pubExp,
+                    key_size=real_modulusLen,
+                )
+            else:
+                self.key = rsa.generate_private_key(
+                    public_exponent=pubExp,
+                    key_size=real_modulusLen,
+                    backend=default_backend(),
+                )
             self.pubkey = self.key.public_key()
         else:
             real_modulusLen = len(binrepr(modulus))
@@ -546,6 +627,37 @@ class PrivKeyECDSA(PrivKey):
         return self.key.sign(data, ec.ECDSA(_get_hash(h)))
 
 
+class PrivKeyEdDSA(PrivKey):
+    """
+    Wrapper for EdDSA keys
+    Use the 'key' attribute to access original object.
+    """
+    @crypto_validator
+    def fill_and_store(self, curve=None):
+        curve = curve or x25519.X25519PrivateKey
+        self.key = curve.generate()
+        self.pubkey = self.key.public_key()
+
+    @crypto_validator
+    def import_from_asn1pkt(self, privkey):
+        self.key = serialization.load_der_private_key(raw(privkey), None,
+                                                      backend=default_backend())  # noqa: E501
+        self.pubkey = self.key.public_key()
+
+    @crypto_validator
+    def verify(self, msg, sig, **kwargs):
+        # 'sig' should be a DER-encoded signature, as per RFC 3279
+        try:
+            self.pubkey.verify(sig, msg)
+            return True
+        except InvalidSignature:
+            return False
+
+    @crypto_validator
+    def sign(self, data, **kwargs):
+        return self.key.sign(data)
+
+
 ################
 # Certificates #
 ################
@@ -562,6 +674,8 @@ class _CertMaker(_PKIObjMaker):
         try:
             cert = X509_Cert(obj.der)
         except Exception:
+            if conf.debug_dissector:
+                raise
             raise Exception("Unable to import certificate")
         obj.import_from_asn1pkt(cert)
         return obj

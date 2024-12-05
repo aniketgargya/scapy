@@ -15,7 +15,7 @@ import struct
 import time
 
 from scapy.ansmachine import AnsweringMachine
-from scapy.arch import get_if_raw_hwaddr, in6_getifaddr
+from scapy.arch import get_if_hwaddr, in6_getifaddr
 from scapy.config import conf
 from scapy.data import EPOCH, ETHER_ANY
 from scapy.compat import raw, orb
@@ -32,6 +32,7 @@ from scapy.layers.inet6 import DomainNameListField, IP6Field, IP6ListField, \
     IPv6
 from scapy.packet import Packet, bind_bottom_up
 from scapy.pton_ntop import inet_pton
+from scapy.sendrecv import send
 from scapy.themes import Color
 from scapy.utils6 import in6_addrtovendor, in6_islladdr
 
@@ -116,6 +117,7 @@ dhcp6opts = {1: "CLIENTID",
              41: "OPTION_NEW_POSIX_TIMEZONE",  # RFC4833
              42: "OPTION_NEW_TZDB_TIMEZONE",  # RFC4833
              48: "OPTION_LQ_CLIENT_LINK",  # RFC5007
+             56: "OPTION_NTP_SERVER",  # RFC5908
              59: "OPT_BOOTFILE_URL",  # RFC5970
              60: "OPT_BOOTFILE_PARAM",  # RFC5970
              61: "OPTION_CLIENT_ARCH_TYPE",  # RFC5970
@@ -174,6 +176,7 @@ dhcp6opts_by_code = {1: "DHCP6OptClientId",
                      # 46: "DHCP6OptLQClientTime",       #RFC5007
                      # 47: "DHCP6OptLQRelayData",        #RFC5007
                      48: "DHCP6OptLQClientLink",  # RFC5007
+                     56: "DHCP6OptNTPServer",  # RFC5908
                      59: "DHCP6OptBootFileUrl",  # RFC5790
                      60: "DHCP6OptBootFileParam",  # RFC5970
                      61: "DHCP6OptClientArchType",  # RFC5970
@@ -416,7 +419,7 @@ class _OptReqListField(StrLenField):
     islist = 1
 
     def i2h(self, pkt, x):
-        if x is None:
+        if not x:
             return []
         return x
 
@@ -961,6 +964,60 @@ class DHCP6OptLQClientLink(_DHCP6OptGuessPayload):  # RFC5007
                                 length_from=lambda pkt: pkt.optlen)]
 
 
+class DHCP6NTPSubOptSrvAddr(Packet):  # RFC5908 sect 4.1
+    name = "DHCP6 NTP Server Address Suboption"
+    fields_desc = [ShortField("optcode", 1),
+                   ShortField("optlen", 16),
+                   IP6Field("addr", "::")]
+
+    def extract_padding(self, s):
+        return b"", s
+
+
+class DHCP6NTPSubOptMCAddr(Packet):  # RFC5908 sect 4.2
+    name = "DHCP6 NTP Multicast Address Suboption"
+    fields_desc = [ShortField("optcode", 2),
+                   ShortField("optlen", 16),
+                   IP6Field("addr", "::")]
+
+    def extract_padding(self, s):
+        return b"", s
+
+
+class DHCP6NTPSubOptSrvFQDN(Packet):  # RFC5908 sect 4.3
+    name = "DHCP6 NTP Server FQDN Suboption"
+    fields_desc = [ShortField("optcode", 3),
+                   FieldLenField("optlen", None, length_of="fqdn"),
+                   DNSStrField("fqdn", "",
+                               length_from=lambda pkt: pkt.optlen)]
+
+    def extract_padding(self, s):
+        return b"", s
+
+
+_ntp_subopts = {1: DHCP6NTPSubOptSrvAddr,
+                2: DHCP6NTPSubOptMCAddr,
+                3: DHCP6NTPSubOptSrvFQDN}
+
+
+def _ntp_subopt_dispatcher(p, **kwargs):
+    cls = conf.raw_layer
+    if len(p) >= 2:
+        o = struct.unpack("!H", p[:2])[0]
+        cls = _ntp_subopts.get(o, conf.raw_layer)
+    return cls(p, **kwargs)
+
+
+class DHCP6OptNTPServer(_DHCP6OptGuessPayload):  # RFC5908
+    name = "DHCP6 NTP Server Option"
+    fields_desc = [ShortEnumField("optcode", 56, dhcp6opts),
+                   FieldLenField("optlen", None, length_of="ntpserver",
+                                 fmt="!H"),
+                   PacketListField("ntpserver", [],
+                                   _ntp_subopt_dispatcher,
+                                   length_from=lambda pkt: pkt.optlen)]
+
+
 class DHCP6OptBootFileUrl(_DHCP6OptGuessPayload):  # RFC5970
     name = "DHCP6 Boot File URL Option"
     fields_desc = [ShortEnumField("optcode", 59, dhcp6opts),
@@ -1387,6 +1444,7 @@ bind_bottom_up(UDP, _dhcp6_dispatcher, {"dport": 546})
 class DHCPv6_am(AnsweringMachine):
     function_name = "dhcp6d"
     filter = "udp and port 546 and port 547"
+    send_function = staticmethod(send)
 
     def usage(self):
         msg = """
@@ -1530,8 +1588,7 @@ DHCPv6_am.parse_options( dns="2001:500::1035", domain="localdomain, local",
             timeval = time.time() - delta
 
             # Mac Address
-            rawmac = get_if_raw_hwaddr(iface)[1]
-            mac = ":".join("%.02x" % orb(x) for x in rawmac)
+            mac = get_if_hwaddr(iface)
 
             self.duid = DUID_LLT(timeval=timeval, lladdr=mac)
 
